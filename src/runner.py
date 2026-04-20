@@ -33,7 +33,7 @@ class TestConfig:
     description: str
     engine: str = "vllm"  # "vllm" or "sglang"
     spec_config: Optional[str] = None  # Speculative decoding config
-    gpu_mem_util: float = 0.90
+    gpu_mem_util: float = 0.85  # Target GPU memory utilization (0.0-1.0) to balance performance and stability
     extra_args: List[str] = field(default_factory=list)
     best_workloads: List[str] = field(default_factory=list)
 
@@ -124,6 +124,7 @@ async def run_workload_async(
     global_timeout_s: Optional[int] = None,
     request_rate: float = float("inf"),
     min_tokens: Optional[int] = None,
+    collect_kv_stats: bool = True,
 ) -> BatchMetrics:
     """
     Run a workload with concurrent requests.
@@ -204,7 +205,7 @@ async def run_workload_async(
         except asyncio.CancelledError:
             pass
 
-    kv_poll_task = asyncio.create_task(_poll_kv())
+    kv_poll_task = asyncio.create_task(_poll_kv()) if collect_kv_stats else None
 
     # Use a single shared session with a connection-pooling connector
     # to avoid overwhelming the server with separate connections
@@ -237,11 +238,12 @@ async def run_workload_async(
                 ]
     finally:
         # Stop KV polling
-        kv_poll_task.cancel()
-        try:
-            await kv_poll_task
-        except asyncio.CancelledError:
-            pass
+        if kv_poll_task is not None:
+            kv_poll_task.cancel()
+            try:
+                await kv_poll_task
+            except asyncio.CancelledError:
+                pass
 
     t1 = time.perf_counter()
 
@@ -278,8 +280,9 @@ def run_workload(
     temperature: float = 0.2,
     request_rate: float = float("inf"),
     min_tokens: Optional[int] = None,
+    collect_kv_stats: bool = True,
 ) -> BatchMetrics:
-    """Synchronous wrapper for run_workload_async."""
+    "Synchronous wrapper for run_workload_async."
     return asyncio.run(run_workload_async(
         base_url=base_url,
         model=model,
@@ -290,6 +293,7 @@ def run_workload(
         temperature=temperature,
         request_rate=request_rate,
         min_tokens=min_tokens,
+        collect_kv_stats=collect_kv_stats,
     ))
 
 

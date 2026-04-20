@@ -1,8 +1,13 @@
 """
 Workload generation for LLM inference benchmarking.
 Provides diverse prompt sets to test different inference characteristics.
+
+Supports saving/loading workloads to/from a JSON file so that both
+vLLM and SGLang notebooks can use identical prompts for fair comparison.
 """
 
+import json
+import os
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List
 
@@ -22,12 +27,12 @@ def build_prompt_from_dolly(ex: Dict[str, Any]) -> str:
 @dataclass
 class WorkloadConfig:
     """Configuration for a benchmark workload."""
-    
+
     name: str
     description: str
     max_tokens: int
     temperature: float
-    
+
     def __post_init__(self):
         # Validate config
         if self.max_tokens <= 0:
@@ -97,7 +102,7 @@ WORKLOAD_CONFIGS = {
 class WorkloadGenerator:
     """
     Generates diverse workloads for benchmarking LLM inference.
-    
+
     Each workload tests different aspects:
     - random_short: Raw decode speed with minimal prefill
     - random_medium: Balanced workload for typical usage
@@ -106,39 +111,116 @@ class WorkloadGenerator:
     - shared_prefix: KV cache reuse / prefix caching
     - repetitive: N-gram speculation effectiveness
     - code: Structured output generation
+
+    Workloads can be saved to and loaded from a JSON file so that both
+    the vLLM and SGLang notebooks benchmark against identical prompts.
     """
-    
+
     def __init__(self, model_id: str = "meta-llama/Llama-3.2-3B-Instruct"):
         """
         Initialize the workload generator.
-        
+
         Args:
             model_id: Model ID for tokenizer (used for length estimation)
         """
         self.tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=True)
         self._workloads: Dict[str, List[str]] = {}
         self._token_counts: Dict[str, List[int]] = {}
-    
+
+    # ------------------------------------------------------------------
+    # Save / Load
+    # ------------------------------------------------------------------
+
+    def save_workloads(self, path: str) -> None:
+        """
+        Save all prepared workloads and token counts to a JSON file.
+
+        The file can be loaded later with :meth:`load_workloads` to
+        guarantee identical prompts across different engine benchmarks.
+
+        Args:
+            path: File path to write (e.g. ``benchmark_prompts.json``).
+        """
+        if not self._workloads:
+            raise RuntimeError(
+                "No workloads to save. Call prepare_workloads() first."
+            )
+
+        payload = {
+            "version": 1,
+            "workloads": self._workloads,
+            "token_counts": self._token_counts,
+        }
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=False)
+
+        n_total = sum(len(v) for v in self._workloads.values())
+        size_kb = os.path.getsize(path) / 1024
+        print(f"  Saved {len(self._workloads)} workloads "
+              f"({n_total} prompts, {size_kb:.1f} KB) → {path}")
+
+    def load_workloads(self, path: str, verbose: bool = True) -> Dict[str, List[str]]:
+        """
+        Load workloads from a previously saved JSON file.
+
+        This replaces any currently prepared workloads.  Token counts are
+        loaded if present; otherwise they are recomputed from the prompts.
+
+        Args:
+            path:    File path to read.
+            verbose: Print summary after loading.
+
+        Returns:
+            Dictionary mapping workload names to prompt lists.
+        """
+        with open(path, "r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+
+        self._workloads = payload["workloads"]
+
+        # Token counts may or may not be in the file
+        if "token_counts" in payload and payload["token_counts"]:
+            self._token_counts = payload["token_counts"]
+        else:
+            # Recompute token counts from prompts
+            self._token_counts = {}
+            for name, prompts in self._workloads.items():
+                self._token_counts[name] = [
+                    len(self.tokenizer.encode(p, add_special_tokens=False))
+                    for p in prompts
+                ]
+
+        if verbose:
+            self._print_workload_stats()
+
+        return self._workloads
+
+    # ------------------------------------------------------------------
+    # Prepare (generate from Dolly, ShareGPT, and Sonnet corpora)
+    # ------------------------------------------------------------------
+
     def prepare_workloads(
         self,
         n_random: int = 256,
         n_shared: int = 50,
-        verbose: bool = True
+        n_dataset: int = 256,
+        verbose: bool = True,
     ) -> Dict[str, List[str]]:
         """
-        Prepare all workloads from the Dolly dataset.
-        
+        Prepare all workloads including Dolly-based, ShareGPT, and Sonnet.
+
         Args:
-            n_random: Number of prompts for random workloads
-            n_shared: Number of prompts for shared prefix workload
-            verbose: Print progress information
-            
+            n_random:  Number of prompts for random / repetitive / code workloads
+            n_shared:  Number of prompts for shared prefix workload
+            n_dataset: Number of prompts for sharegpt and sonnet workloads
+            verbose:   Print progress information
+
         Returns:
             Dictionary mapping workload names to prompt lists
         """
         if verbose:
             print("Loading Dolly dataset...")
-        
+
         ds = load_dataset("databricks/databricks-dolly-15k", split="train")
 
         # Build prompts with length info
@@ -222,6 +304,49 @@ class WorkloadGenerator:
             for p in code_prompts
         ]
 
+        # ShareGPT workload (real ChatGPT conversations)
+        sharegpt_prompts = []
+        try:
+            from .datasets import load_sharegpt  # noqa: PLC0415
+
+            if verbose:
+                print("Loading ShareGPT dataset...")
+            samples = load_sharegpt(
+                num_prompts=n_dataset,
+                tokenizer=self.tokenizer,
+                input_len=512,
+                output_len=128,
+                seed=42,
+            )
+            sharegpt_prompts = [s.prompt for s in samples]
+            self._token_counts["sharegpt"] = [s.input_tokens for s in samples]
+        except Exception as e:
+            if verbose:
+                print(f"  [WARNING] Could not load ShareGPT dataset: {e}")
+                print("  The 'sharegpt' workload will be empty.")
+
+        # Sonnet workload (Shakespeare sonnets chunked to target length)
+        sonnet_prompts = []
+        try:
+            from .datasets import load_sonnet  # noqa: PLC0415
+
+            if verbose:
+                print("Loading Sonnet dataset...")
+            samples = load_sonnet(
+                num_prompts=n_dataset,
+                tokenizer=self.tokenizer,
+                input_len=550,
+                output_len=150,
+                prefix_len=0,
+                seed=42,
+            )
+            sonnet_prompts = [s.prompt for s in samples]
+            self._token_counts["sonnet"] = [s.input_tokens for s in samples]
+        except Exception as e:
+            if verbose:
+                print(f"  [WARNING] Could not load Sonnet dataset: {e}")
+                print("  The 'sonnet' workload will be empty.")
+
         self._workloads = {
             "random_short": [p for p, _ in short_prompts],
             "random_medium": [p for p, _ in medium_prompts],
@@ -230,6 +355,8 @@ class WorkloadGenerator:
             "shared_prefix": shared_prefix_prompts,
             "repetitive": repetitive_prompts,
             "code": code_prompts,
+            "sharegpt": sharegpt_prompts,
+            "sonnet": sonnet_prompts,
         }
 
         if verbose:
@@ -240,7 +367,7 @@ class WorkloadGenerator:
     def _pad_prompts(
         self,
         prompts: List[tuple],
-        target_count: int
+        target_count: int,
     ) -> List[tuple]:
         """Pad prompt list to target count by cycling."""
         if len(prompts) == 0:
@@ -257,7 +384,7 @@ class WorkloadGenerator:
         max_prefix_tokens: int = 400,  # Limit prefix size for memory safety
     ) -> tuple:
         """Create shared prefix workload for testing KV cache reuse.
-        
+
         Args:
             ds: Dataset to pull context from
             n_shared: Number of prompts to generate
@@ -269,13 +396,13 @@ class WorkloadGenerator:
         mid_ctx_examples = ds.filter(
             lambda x: x.get("context") and 800 < len(x["context"]) < 2000
         )
-        
+
         if len(mid_ctx_examples) > 0:
             prefix = mid_ctx_examples[0]["context"].strip()
         else:
             # Fallback: concatenate a few prompts
             prefix = "\n\n".join([build_prompt_from_dolly(ds[i]) for i in range(5)])
-        
+
         # Truncate prefix to max_prefix_tokens to prevent OOM at high batch sizes
         prefix_tokens = self.tokenizer.encode(prefix, add_special_tokens=False)
         if len(prefix_tokens) > max_prefix_tokens:
@@ -294,17 +421,17 @@ class WorkloadGenerator:
             "Identify assumptions made in the text.",
             "Write a tweet summarizing this.",
         ]
-        
+
         prompts = [
             f"{prefix}\n\nQuestion: {questions[i % len(questions)]}"
             for i in range(n_shared)
         ]
-        
+
         token_counts = [
             len(self.tokenizer.encode(p, add_special_tokens=False))
             for p in prompts
         ]
-        
+
         return prompts, token_counts
 
     def _create_repetitive_workload(self, n_random: int) -> List[str]:
@@ -319,7 +446,7 @@ class WorkloadGenerator:
             "Write the alphabet, then write it backwards.",
             "Create a pattern: AABB, AABB, AABB... continue for 10 lines.",
         ]
-        
+
         prompts = base_prompts * (n_random // len(base_prompts) + 1)
         return prompts[:n_random]
 
@@ -335,7 +462,7 @@ class WorkloadGenerator:
             "Write a Python function to merge two sorted lists.",
             "Write a JavaScript async function that fetches data with retry logic.",
         ]
-        
+
         prompts = base_prompts * (n_random // len(base_prompts) + 1)
         return prompts[:n_random]
 
@@ -343,15 +470,18 @@ class WorkloadGenerator:
         """Print statistics about prepared workloads."""
         print("\n📊 Workload Statistics:")
         print("-" * 60)
-        
+
         for name, prompts in self._workloads.items():
             tokens = self._token_counts.get(name, [])
             if tokens:
                 import numpy as np
+
                 print(f"  {name}:")
                 print(f"    Prompts: {len(prompts)}")
-                print(f"    Tokens - min: {min(tokens)}, max: {max(tokens)}, "
-                      f"mean: {np.mean(tokens):.1f}, median: {np.median(tokens):.1f}")
+                print(
+                    f"    Tokens - min: {min(tokens)}, max: {max(tokens)}, "
+                    f"mean: {np.mean(tokens):.1f}, median: {np.median(tokens):.1f}"
+                )
         print("-" * 60)
 
     def get_workload(self, name: str) -> List[str]:
