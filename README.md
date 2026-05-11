@@ -1,11 +1,12 @@
 # workload-aware-llm-benchmarking
 
 Benchmarking suite and analysis pipeline for the paper
-**"Workload Matters: Benchmarking LLM Inference Optimizations in Modern Serving Systems"**
+**"A Systematic Study of LLM Inference Optimizations Under
+Diverse Workloads Distributions"**
 (Abhinav Khanduja, University of Illinois Urbana-Champaign).
 
 This repository contains everything needed to reproduce the paper's results and to
-extend the suite to new engines, configurations, or workloads.
+extend the suite to new engines, configurations, or workloads. The dataaset used for prompts can also be found on Zenodo, at https://zenodo.org/records/20128763?token=eyJhbGciOiJIUzUxMiJ9.eyJpZCI6ImIxMTk3NGYwLTc4NmMtNGFiZC05YmJmLTliOTc4YzQzNDA3ZiIsImRhdGEiOnt9LCJyYW5kb20iOiI4MGE2Yzk3OTgxNWFjYTYwZDQ1OTlmY2RlYzNkMzZmYyJ9.bTNiAt1IIjZRnOONBMnp-J2QUKNRmeEVhdweyKI4xXBE0O3ukYAoHI0WYVUpBd4P9XM4ZOPXaUVdzVyVBTtoQg
 
 ---
 
